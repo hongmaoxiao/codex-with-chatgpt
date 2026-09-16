@@ -244,10 +244,14 @@ export function mergeSession(previous: SavedSession | null, patch: SessionPatch)
         patch.checkpoint.nextExpectedStep ?? previous?.checkpoint?.nextExpectedStep,
         CHECKPOINT_LIMITS.nextExpectedStep
       ),
-      chatUrl: patch.checkpoint.chatUrl ?? previous?.checkpoint?.chatUrl ?? url,
-      projectUrl: patch.checkpoint.projectUrl ?? previous?.checkpoint?.projectUrl ?? projectUrl,
+      chatUrl: patch.checkpoint.chatUrl ?? patch.url ?? previous?.checkpoint?.chatUrl ?? url,
+      projectUrl: patch.checkpoint.projectUrl ?? patch.projectUrl ?? previous?.checkpoint?.projectUrl ?? projectUrl,
       updatedAt: new Date().toISOString(),
     };
+  }
+
+  if (checkpoint && !patch.checkpoint && (patch.url || patch.projectUrl)) {
+    checkpoint = { ...checkpoint, chatUrl: url, projectUrl, updatedAt: new Date().toISOString() };
   }
 
   return {

@@ -15,7 +15,7 @@ import { namedTunnelBinding, readTunnelState } from "../tunnel/state.js";
 import { Logger, nullLogger } from "../logger/index.js";
 import { DEFAULT_HOST, DEFAULT_PORT } from "../config/paths.js";
 import { SERVICE_NAME, VERSION } from "../version.js";
-import { writeRuntimeState, clearRuntimeState, type RuntimeState } from "./runtime.js";
+import { writeRuntimeState, clearRuntimeState, probeBridge, type RuntimeState } from "./runtime.js";
 
 function tunnelForWorkspace(workspaceId: string, logger: Logger): TunnelProvider {
   const binding = namedTunnelBinding(readTunnelState(workspaceId));
@@ -56,11 +56,17 @@ export interface Bridge {
 }
 
 /**
- * Listen on the preferred port; on EADDRINUSE fall back to an ephemeral port.
+ * Reject a duplicate project process; try nearby ports for unrelated collisions.
  */
-function listen(app: express.Express, host: string, preferredPort: number): Promise<{ server: Server; port: number }> {
+export class BridgeAlreadyRunningError extends Error {
+  constructor(readonly port: number) {
+    super("A bridge for this workspace is already listening.");
+  }
+}
+
+function listen(app: express.Express, host: string, preferredPort: number, workspaceId: string): Promise<{ server: Server; port: number }> {
   return new Promise((resolve, reject) => {
-    const tryListen = (port: number, allowFallback: boolean): void => {
+    const tryListen = (port: number, remaining: number): void => {
       const server = app.listen(port, host);
       server.once("listening", () => {
         const address = server.address();
@@ -68,14 +74,24 @@ function listen(app: express.Express, host: string, preferredPort: number): Prom
         resolve({ server, port: actual });
       });
       server.once("error", (error: NodeJS.ErrnoException) => {
-        if (error.code === "EADDRINUSE" && allowFallback) {
-          tryListen(0, false);
-        } else {
+        if (error.code !== "EADDRINUSE" || port === 0 || remaining === 0) {
           reject(error);
+          return;
         }
+        void probeBridge(port, 500).then((health) => {
+          if (health?.workspaceId === workspaceId) {
+            reject(new BridgeAlreadyRunningError(port));
+          } else if (!health) {
+            reject(new Error(`Port ${port} is occupied but its owner cannot be verified; refusing to start a duplicate bridge.`));
+          } else {
+            // A deterministic fallback lets concurrent starters find the same
+            // project instance instead of each spawning an ephemeral duplicate.
+            tryListen(port === 65535 ? 49152 : port + 1, remaining - 1);
+          }
+        }, reject);
       });
     };
-    tryListen(preferredPort, preferredPort !== 0);
+    tryListen(preferredPort, 32);
   });
 }
 
@@ -93,6 +109,8 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   const adminToken = `c2c_admin_${randomBytes(24).toString("base64url")}`;
 
   let publicBaseUrl: string | null = null;
+  let tunnelOperation: Promise<string> | null = null;
+  let closed = false;
 
   const app = express();
   app.set("trust proxy", true);
@@ -108,7 +126,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   // ---- Health (public but minimal) ---------------------------------------
 
   app.get("/health", (_req, res) => {
-    res.json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: "ok" });
+    res.status(closed ? 503 : 200).json({ service: SERVICE_NAME, version: VERSION, workspaceId: workspace.id, status: closed ? "stopping" : "ok" });
   });
 
   // ---- OAuth + discovery ---------------------------------------------------
@@ -171,12 +189,26 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
       pairingActive: pairing.hasActiveSession(),
       pid: process.pid,
       startedAt,
+      capabilities: { worktrees: true },
     });
   });
 
-  app.post("/admin/tunnel/start", adminGuard, (_req, res) => {
-    tunnel
-      .start(port)
+  const startTunnel = (restart: boolean): Promise<string> => {
+    if (closed) return Promise.reject(new Error("Bridge is shutting down"));
+    if (tunnelOperation) return tunnelOperation;
+    const operation = (async () => {
+      if (restart) await tunnel.stop();
+      return tunnel.start(port);
+    })();
+    tunnelOperation = operation;
+    void operation.finally(() => {
+      if (tunnelOperation === operation) tunnelOperation = null;
+    }).catch(() => undefined);
+    return operation;
+  };
+
+  app.post(["/admin/tunnel/start", "/admin/tunnel/restart"], adminGuard, (req, res) => {
+    startTunnel(req.path.endsWith("/restart"))
       .then((url) => {
         publicBaseUrl = url;
         persistRuntime();
@@ -189,11 +221,13 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   });
 
   app.post("/admin/tunnel/stop", adminGuard, (_req, res) => {
-    void tunnel.stop().then(() => {
+    void (async () => {
+      await tunnelOperation?.catch(() => undefined);
+      await tunnel.stop();
       publicBaseUrl = null;
       persistRuntime();
       res.json({ stopped: true });
-    });
+    })().catch(() => res.status(500).json({ error: "tunnel_stop_failed" }));
   });
 
   app.post("/admin/revoke-all", adminGuard, (_req, res) => {
@@ -210,7 +244,7 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
     }, 100);
   });
 
-  const { server, port } = await listen(app, host, opts.port ?? DEFAULT_PORT);
+  const { server, port } = await listen(app, host, opts.port ?? DEFAULT_PORT, workspace.id);
   const startedAt = new Date().toISOString();
   logger.info(`Bridge listening on ${host}:${port} for workspace ${workspace.name} (${workspace.id})`);
 
@@ -231,10 +265,10 @@ export async function startBridge(opts: BridgeOptions): Promise<Bridge> {
   };
   persistRuntime();
 
-  let closed = false;
   const shutdown = async (): Promise<void> => {
     if (closed) return;
     closed = true;
+    await tunnelOperation?.catch(() => undefined);
     await tunnel.stop().catch(() => undefined);
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (opts.persistRuntime !== false) clearRuntimeState(workspace.id);

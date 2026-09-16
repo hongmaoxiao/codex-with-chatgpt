@@ -108,6 +108,7 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       const scan = (stream: NodeJS.ReadableStream): void => {
         const rl = readline.createInterface({ input: stream });
         rl.on("line", (line) => {
+          if (this.child !== child) return;
           if (CONNECTED_RE.test(line) && !this.connected) {
             this.connected = true;
             const url = this.publicUrl();
@@ -124,11 +125,17 @@ export class CloudflaredNamedTunnel implements TunnelProvider {
       if (child.stderr) scan(child.stderr);
 
       child.on("error", (error) => {
-        this.child = null;
-        this.connected = false;
+        if (this.child === child) {
+          this.child = null;
+          this.connected = false;
+        }
         finish(() => reject(error));
       });
       child.on("exit", (code) => {
+        if (this.child !== child) {
+          finish(() => reject(new Error("Named tunnel stopped before connecting")));
+          return;
+        }
         const wasStarting = !this.connected;
         this.logger.warn(`cloudflared named tunnel exited with code ${code}`);
         this.child = null;

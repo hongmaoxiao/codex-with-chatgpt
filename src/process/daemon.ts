@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ensureDir, getStateDir } from "../config/paths.js";
-import { findBridgeObservation, findLiveBridge, probeBridge, readRuntimeState, type RuntimeState } from "../bridge/runtime.js";
+import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
 import { Workspace } from "../workspace/manager.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -23,6 +23,11 @@ function cliEntry(): { cmd: string; args: string[] } {
 export interface EnsureBridgeResult {
   runtime: RuntimeState;
   spawned: boolean;
+}
+
+/** Stable per-project port; the OS bind is also the cross-process startup arbiter. */
+export function preferredBridgePort(workspaceId: string): number {
+  return 49152 + (parseInt(workspaceId.slice(0, 8), 16) % 16000);
 }
 
 /**
@@ -50,9 +55,10 @@ export async function ensureBridge(workspaceRoot: string, opts: { port?: number 
     // Windows / filesystems without chmod semantics
   }
   const { cmd, args } = cliEntry();
+  const preferredPort = opts.port ?? observation.runtime?.port ?? preferredBridgePort(workspace.id);
   const child = spawn(
     cmd,
-    [...args, "serve", "--workspace", workspace.root, ...(opts.port ? ["--port", String(opts.port)] : [])],
+    [...args, "serve", "--workspace", workspace.root, "--port", String(preferredPort)],
     {
       detached: true,
       stdio: ["ignore", out, out],
@@ -101,21 +107,17 @@ export async function adminFetch<T = unknown>(
 
 export async function stopBridge(workspaceRoot: string): Promise<boolean> {
   const workspace = new Workspace(workspaceRoot);
-  const runtime = readRuntimeState(workspace.id);
-  if (!runtime) return false;
-  const healthy = await probeBridge(runtime.port);
-  if (healthy && healthy.workspaceId === workspace.id) {
-    try {
-      await adminFetch(runtime, "POST", "/admin/shutdown", 5000);
-      return true;
-    } catch {
-      // fall through to kill
-    }
+  const observation = await findBridgeObservation(workspace.id);
+  if (observation.state === "stopped") return false;
+  if (observation.state === "unknown") {
+    throw new Error(`Bridge state is uncertain (${observation.reason}); refusing to stop an unverified process.`);
   }
-  try {
-    process.kill(runtime.pid, "SIGTERM");
-    return true;
-  } catch {
-    return false;
+  await adminFetch(observation.runtime, "POST", "/admin/shutdown", 5000);
+  const deadline = Date.now() + 55_000;
+  while (Date.now() < deadline) {
+    const current = await findBridgeObservation(workspace.id);
+    if (current.state === "stopped" || current.runtime?.pid !== observation.runtime.pid) return true;
+    await new Promise((resolve) => setTimeout(resolve, 200));
   }
+  throw new Error("Bridge has not finished shutting down; do not start a replacement yet.");
 }

@@ -8,6 +8,10 @@ import { readJsonIfExists } from "../config/paths.js";
 export type WorkspaceErrorCode =
   | "INVALID_PATH"
   | "PATH_OUTSIDE_WORKSPACE"
+  | "WORKTREE_NOT_FOUND"
+  | "WORKTREE_CONTEXT_MISMATCH"
+  | "WORKTREE_PROJECT_REQUIRED"
+  | "WORKTREE_SELECTION_REQUIRED"
   | "ACCESS_DENIED_SENSITIVE_FILE"
   | "FILE_NOT_FOUND"
   | "NOT_A_FILE"
@@ -88,7 +92,7 @@ export class Workspace {
   readonly ignoreRules: IgnoreRules;
   readonly projectConfig: ProjectConfig;
 
-  constructor(rootInput: string) {
+  constructor(rootInput: string, inheritedIgnoreRules?: IgnoreRules) {
     const resolved = path.resolve(rootInput);
     let real: string;
     try {
@@ -101,7 +105,7 @@ export class Workspace {
     }
     this.root = real;
     this.id = createHash("sha256").update(normCase(real)).digest("hex").slice(0, 12);
-    this.ignoreRules = new IgnoreRules(real);
+    this.ignoreRules = new IgnoreRules(real, inheritedIgnoreRules);
     this.projectConfig = parseProjectConfig(readJsonIfExists<unknown>(path.join(real, ".c2c.json")));
     this.name = this.projectConfig.name ?? path.basename(real);
   }

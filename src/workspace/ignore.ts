@@ -77,7 +77,7 @@ export class IgnoreRules {
   private noise: Ignore;
   private custom: Ignore;
 
-  constructor(workspaceRoot: string) {
+  constructor(workspaceRoot: string, private readonly inherited?: IgnoreRules) {
     this.sensitive = ignore().add(SENSITIVE_PATTERNS);
     this.noise = ignore().add(NOISE_PATTERNS);
     this.custom = ignore();
@@ -94,7 +94,7 @@ export class IgnoreRules {
   /** True when the path must be denied with ACCESS_DENIED_SENSITIVE_FILE. */
   isSensitive(relPath: string): boolean {
     if (!relPath || relPath === ".") return false;
-    return this.sensitive.ignores(relPath) || this.custom.ignores(relPath);
+    return this.sensitive.ignores(relPath) || this.custom.ignores(relPath) || Boolean(this.inherited?.isSensitive(relPath));
   }
 
   /** True when the path should be hidden from listing/search (not an error). */

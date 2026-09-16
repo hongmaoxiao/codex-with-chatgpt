@@ -69,9 +69,12 @@ whatever data it needs by itself.
      conversation opens a new chat from the Project collection page — never
      `goto` `https://chatgpt.com/` to create it, and never reuse another
      Codex conversation's chat URL just because `session.url` exists.
-   Each workspace also has exactly ONE ChatGPT connector. Do not create a
-   second connector for the same workspace. Other workspaces may have their
-   own connectors — never edit those.
+   Each configured project has ONE ChatGPT connector. Task worktrees registered
+   to that project reuse it, with an explicit worktree selector on every tool
+   call. They keep independent chats, checkpoints and execution records.
+   Do not create a connector or Project collection per issue. Independently
+   configured projects can have their own connectors, including projects that
+   happen to be linked worktrees of the same Git repository.
 7. After first-time setup, never ask the user to approve writing C2C's local
    settings directory. Run `c2c sandbox-allow --json` (idempotent). If it fails
    with EPERM / Operation not permitted, request elevated permissions and retry
@@ -83,6 +86,8 @@ whatever data it needs by itself.
    `chatgptRepair.needed` is true. Not green:
    - `report.bridge.ok` is not true
    - `report.mcp.ok` is not true (unauthenticated local `/mcp` must be 401)
+   - `report.worktrees.ok` is false (upgrade the existing project bridge as
+     described in [Registered worktrees](references/worktrees.md))
    - sandbox / state-dir write failed (EPERM)
    - this workspace used to have a public URL and the tunnel is down
    - `chatgptRepair.needed` is true (fix the connector first, then doctor again)
@@ -97,6 +102,16 @@ whatever data it needs by itself.
    public address.
    A ChatGPT-side 401 after a sent message is different: repair then, do not
    treat it as permission to skip this gate next time.
+
+## Registered task worktrees
+
+For an issue/task worktree whose owning project is known, read
+[Registered worktrees](references/worktrees.md) before connection setup.
+This is the normal unattended path: register the task directory locally,
+reuse the project's existing authorization and Project collection, and use
+`context.mcpArguments` on every ChatGPT tool call. Do not enter first-time
+connector creation or ask the user to pair merely because the task directory
+is new. Genuine login/security challenges still follow the active tool policy.
 
 ## In-app browser (ChatGPT)
 
@@ -215,11 +230,15 @@ commands (both are cheap / cached; never mention them unless an update exists):
 
 Inside the checkout directory (see Locations):
 
-1. `git pull --ff-only` (if it fails due to local edits: `git stash && git pull --ff-only`).
+1. `git pull --ff-only` only on a clean upstream checkout. Preserve local
+   changes and local extension commits; do not stash or overwrite them to
+   force an update. A customized installation needs a deliberate merge and
+   verification before it replaces a running bridge.
 2. `corepack pnpm install && corepack pnpm build`.
-3. Re-install the Skill: copy `skill/SKILL.md` to
-   `~/.codex/skills/codex-with-chatgpt/SKILL.md`, then fix the "checkout lives at:"
-   line in the copy to the actual checkout path.
+3. Re-install `skill/SKILL.md` and its `skill/references/` files under
+   `~/.codex/skills/codex-with-chatgpt/`, then fix the "checkout lives at:"
+   line to the actual checkout path. Preserve machine-specific notes in the
+   installed Skill.
 4. `c2c sandbox-allow --json` (so existing installs pick up the sandbox allowlist),
    then `c2c restart -w <workspace>` so the bridge runs the new code, then
    `c2c update-check --force --json` to refresh the cache (should now report up to date).
@@ -516,7 +535,8 @@ Do not invent `STATE: RESUME`. If the original chat is gone, send HANDOFF.
 All control messages start with `[C2C]`. Keep Codex→ChatGPT messages under 1 KB.
 ChatGPT's replies are expected to be substantive (see step 3). Docs: `docs/protocol.md`.
 
-0. `c2c tunnel status -w <workspace> --json`. If `needsChoice`, follow
+0. For a task worktree, first complete **Registered task worktrees** above.
+   Then `c2c tunnel status -w <workspace> --json`. If `needsChoice`, follow
    **Connection choice** first (existing installs: ask once, then remember).
    Then `c2c doctor -w <workspace> --json` (auto-repairs). **Doctor gate:** if local
    is not green, do not open ChatGPT and do not send INIT. If

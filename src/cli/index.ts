@@ -3,10 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { startBridge } from "../bridge/server.js";
-import { findBridgeObservation, findLiveBridge, type RuntimeState } from "../bridge/runtime.js";
+import { startBridge, BridgeAlreadyRunningError } from "../bridge/server.js";
+import { findBridgeObservation, findLiveBridge, probeBridgeAt, type RuntimeState } from "../bridge/runtime.js";
 import { adminFetch, ensureBridge, stopBridge } from "../process/daemon.js";
 import { Workspace } from "../workspace/manager.js";
+import { resolveConnection, taskSession } from "../config/connection.js";
+import { bindWorktree } from "../workspace/worktrees.js";
 import { AuthStore } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
 import {
@@ -19,7 +21,6 @@ import { parseZoneInput, suggestedNamedHostname } from "../tunnel/hostname.js";
 import {
   isNamedTunnelReady,
   NAMED_LOGIN_PROMPT,
-  NAMED_REPAIR_MESSAGE,
   needsTunnelChoice,
   readTunnelState,
   TUNNEL_CHOICE_PROMPT,
@@ -45,7 +46,6 @@ import { PRODUCT_NAME, VERSION } from "../version.js";
 import {
   clearChatPointer,
   mergeSession,
-  readSession,
   resolveConversation,
   writeSession,
   PROTOCOL_STATES,
@@ -136,7 +136,7 @@ function persistWorkspaceEndpoint(opts: {
   return connectorName;
 }
 
-function tunnelChoicePayload(workspace: Workspace, zoneHint?: string): Record<string, unknown> {
+function tunnelChoicePayload(workspace: Workspace, zoneHint?: string) {
   const state = readTunnelState(workspace.id);
   const zone = parseZoneInput(zoneHint ?? "") ?? state.zone ?? null;
   return {
@@ -187,6 +187,7 @@ interface AdminInfo {
   pairingActive: boolean;
   pid: number;
   startedAt: string;
+  capabilities?: { worktrees?: boolean };
 }
 
 async function ensureBridgeAndTunnel(
@@ -231,11 +232,17 @@ program
   .option("--port <port>", "preferred port")
   .action(async (opts: { workspace: string; port?: string }) => {
     const logger = new Logger({ name: "bridge", console: true });
-    const bridge = await startBridge({
-      workspaceRoot: resolveWorkspace(opts.workspace),
-      port: opts.port ? parseInt(opts.port, 10) : undefined,
-      logger,
-    });
+    let bridge;
+    try {
+      bridge = await startBridge({
+        workspaceRoot: resolveWorkspace(opts.workspace),
+        port: opts.port ? parseInt(opts.port, 10) : undefined,
+        logger,
+      });
+    } catch (error) {
+      if (error instanceof BridgeAlreadyRunningError) return;
+      throw error;
+    }
     const shutdown = (): void => {
       void bridge.close().then(() => process.exit(0));
     };
@@ -253,7 +260,8 @@ program
   .option("--tunnel", "also establish the secure public connection", false)
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; tunnel: boolean; json: boolean }) => {
-    const root = resolveWorkspace(opts.workspace);
+    const context = resolveConnection(resolveWorkspace(opts.workspace));
+    const root = context.connection.root;
     try {
       const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
       const connectorName = mcpUrl
@@ -266,7 +274,7 @@ program
           })
         : readLastEndpoint(info.workspaceId)?.connectorName;
       if (opts.json) {
-        say(JSON.stringify({ ok: true, port: runtime.port, workspaceId: info.workspaceId, mcpUrl, connectorName }));
+        say(JSON.stringify({ ok: true, port: runtime.port, workspaceId: info.workspaceId, mcpUrl, connectorName, context: context.context }));
         return;
       }
       check(`当前项目已识别（${info.workspaceName}）`);
@@ -286,7 +294,8 @@ program
   .option("--no-tunnel", "local-only setup (development)")
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; tunnel: boolean; json: boolean }) => {
-    const root = resolveWorkspace(opts.workspace);
+    const context = resolveConnection(resolveWorkspace(opts.workspace));
+    const root = context.connection.root;
     try {
       if (!opts.json) {
         say(PRODUCT_NAME);
@@ -296,6 +305,9 @@ program
       }
       const sandbox = trySandboxAllow();
       const { runtime, info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
+      if (context.shared && !info.capabilities?.worktrees) {
+        throw new Error("BRIDGE_UPGRADE_REQUIRED: restart the existing project bridge before connecting this worktree.");
+      }
       const connectorName = mcpUrl
         ? persistWorkspaceEndpoint({
             workspaceId: info.workspaceId,
@@ -310,7 +322,10 @@ program
             previousName: readLastEndpoint(info.workspaceId)?.connectorName,
             hadEndpointBefore: Boolean(readLastEndpoint(info.workspaceId)),
           });
-      const pairingResult = await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing");
+      const requiresPairing = info.tokenCount === 0;
+      const pairingResult = requiresPairing
+        ? await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing")
+        : null;
       const tunnelState = readTunnelState(info.workspaceId);
       if (opts.json) {
         say(
@@ -321,8 +336,11 @@ program
             connectorName,
             mcpUrl: mcpUrl ?? `http://127.0.0.1:${runtime.port}/mcp`,
             local: mcpUrl === null,
-            pairingCode: pairingResult.code,
-            pairingExpiresAt: pairingResult.expiresAt,
+            context: context.context,
+            reusedConnection: !requiresPairing,
+            requiresPairing,
+            pairingCode: pairingResult?.code,
+            pairingExpiresAt: pairingResult?.expiresAt,
             sandbox,
             tunnel: {
               mode: isNamedTunnelReady(tunnelState) ? "named" : "quick",
@@ -338,6 +356,10 @@ program
       if (mcpUrl) check("安全连接已建立");
       say("");
       say(`连接地址：${mcpUrl ?? `http://127.0.0.1:${runtime.port}/mcp`}`);
+      if (!pairingResult) {
+        check("已复用项目的现有授权，无需新建连接或配对");
+        return;
+      }
       say(`配对码：${pairingResult.code}（${Math.round((pairingResult.expiresAt - Date.now()) / 60000)} 分钟内有效）`);
       say("");
       say("下一步：在 ChatGPT 的连接器设置中添加以上地址（OAuth），并在授权页输入配对码。");
@@ -354,7 +376,9 @@ program
   .description("Stop the bridge for this workspace")
   .option("-w, --workspace <path>")
   .action(async (opts: { workspace?: string }) => {
-    const stopped = await stopBridge(resolveWorkspace(opts.workspace));
+    const context = resolveConnection(resolveWorkspace(opts.workspace));
+    if (context.shared) throw new Error("SHARED_CONNECTION: stop must explicitly target the main project directory.");
+    const stopped = await stopBridge(context.connection.root);
     if (stopped) check("Bridge 已停止");
     else say("没有正在运行的 Bridge。");
   });
@@ -365,9 +389,8 @@ program
   .option("-w, --workspace <path>")
   .option("--tunnel", "re-establish the secure public connection", false)
   .action(async (opts: { workspace?: string; tunnel: boolean }) => {
-    const root = resolveWorkspace(opts.workspace);
+    const root = resolveConnection(resolveWorkspace(opts.workspace)).connection.root;
     await stopBridge(root);
-    await new Promise((resolve) => setTimeout(resolve, 500));
     try {
       const { info, mcpUrl } = await ensureBridgeAndTunnel(root, { tunnel: opts.tunnel });
       check(`Bridge 已重启（${info.workspaceName}）`);
@@ -385,8 +408,8 @@ program
   .option("-w, --workspace <path>")
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; json: boolean }) => {
-    const root = resolveWorkspace(opts.workspace);
-    const workspace = new Workspace(root);
+    const context = resolveConnection(resolveWorkspace(opts.workspace));
+    const workspace = context.connection;
     const observation = await findBridgeObservation(workspace.id);
     if (observation.state === "unknown") {
       if (opts.json) {
@@ -404,7 +427,7 @@ program
     const runtime = observation.runtime;
     const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     if (opts.json) {
-      say(JSON.stringify({ ok: true, running: true, ...info }));
+      say(JSON.stringify({ ok: true, running: true, ...info, context: context.context }));
       return;
     }
     say(PRODUCT_NAME);
@@ -425,7 +448,8 @@ program
   .option("--no-fix", "diagnose only, do not repair")
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; fix: boolean; json: boolean }) => {
-    const root = resolveWorkspace(opts.workspace);
+    const context = resolveConnection(resolveWorkspace(opts.workspace));
+    const root = context.connection.root;
     const report: Record<string, { ok: boolean; detail?: string }> = {};
     const results: string[] = [];
 
@@ -513,7 +537,6 @@ program
       : "Codex with ChatGPT";
     const tunnelState = workspace ? readTunnelState(workspace.id) : null;
     const namedReady = tunnelState ? isNamedTunnelReady(tunnelState) : false;
-    let namedRepair: { needed: boolean; userMessage?: string } = { needed: false };
     let chatgptRepair: {
       needed: boolean;
       reason?: string;
@@ -544,9 +567,14 @@ program
 
     if (runtime) {
       let info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+      if (context.shared) {
+        report.worktrees = {
+          ok: info.capabilities?.worktrees === true,
+          detail: info.capabilities?.worktrees ? "已复用项目连接" : "BRIDGE_UPGRADE_REQUIRED",
+        };
+      }
       if (namedReady && opts.fix && info.tunnel.provider !== "cloudflare-named") {
         await stopBridge(root);
-        await new Promise((resolve) => setTimeout(resolve, 400));
         try {
           runtime = (await ensureBridge(root)).runtime;
           info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
@@ -557,15 +585,7 @@ program
       }
       const expectedPublic = Boolean(lastEndpoint?.publicUrl) || namedReady;
       let currentUrl = info.publicUrl ?? info.tunnel.url;
-      let healthy = false;
-      if (currentUrl) {
-        try {
-          const response = await fetch(`${currentUrl}/health`, { signal: AbortSignal.timeout(8000) });
-          healthy = response.ok;
-        } catch {
-          healthy = false;
-        }
-      }
+      let healthy = currentUrl ? (await probeBridgeAt(currentUrl))?.workspaceId === info.workspaceId : false;
 
       if ((!currentUrl || !healthy) && opts.fix && (expectedPublic || info.tunnel.running)) {
         try {
@@ -573,15 +593,22 @@ program
           if (!binaries.cloudflared) {
             report.tunnel = { ok: false, detail: "NEED_CLOUDFLARED" };
           } else {
-            const started = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
+            const route = info.tunnel.running ? "/admin/tunnel/restart" : "/admin/tunnel/start";
+            const started = await adminFetch<TunnelStartResponse>(runtime, "POST", route, 55_000);
             if (started.url) {
               const previousUrl = lastEndpoint?.publicUrl;
               currentUrl = started.url;
-              healthy = true;
+              // Starting a process or receiving its URL does not prove that
+              // the public route has recovered, or even points at this project.
+              for (let attempt = 0; attempt < 3; attempt++) {
+                healthy = (await probeBridgeAt(currentUrl))?.workspaceId === info.workspaceId;
+                if (healthy) break;
+                if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 1000));
+              }
               info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
               const sameAddress =
                 previousUrl && normalizePublicUrl(previousUrl) === normalizePublicUrl(started.url);
-              results.push(sameAddress ? "已重新建立安全连接" : "已重新建立安全连接（地址已更换）");
+              if (healthy) results.push(sameAddress ? "已重新建立安全连接" : "已重新建立安全连接（地址已更换）");
             }
           }
         } catch (error) {
@@ -618,7 +645,8 @@ program
         }
       } else if (namedReady) {
         report.tunnel = report.tunnel ?? { ok: false, detail: "NAMED_TUNNEL_DOWN" };
-        namedRepair = { needed: true, userMessage: NAMED_REPAIR_MESSAGE };
+        // A transient network failure is not evidence of expired account
+        // authorization. Keep the fixed address/grant and retry on the next run.
       } else if (expectedPublic) {
         report.tunnel = report.tunnel ?? { ok: false, detail: "安全连接未恢复" };
         chatgptRepair = {
@@ -639,7 +667,6 @@ program
       report.tunnel = report.tunnel ?? { ok: false, detail: "Bridge 状态无法确认，未执行连接器修复" };
     } else if (namedReady) {
       report.tunnel = { ok: false, detail: "NAMED_TUNNEL_DOWN" };
-      namedRepair = { needed: true, userMessage: NAMED_REPAIR_MESSAGE };
     } else if (lastEndpoint?.publicUrl) {
       report.tunnel = { ok: false, detail: "安全连接未运行" };
       chatgptRepair = {
@@ -653,7 +680,7 @@ program
     }
 
     if (opts.json) {
-      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair }));
+      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair: { needed: false }, context: context.context }));
       return;
     }
     say(`${PRODUCT_NAME} Doctor`);
@@ -678,10 +705,6 @@ program
     }
     for (const repair of results) say(`· ${repair}`);
     say("");
-    if (namedRepair.needed && namedRepair.userMessage) {
-      say(namedRepair.userMessage);
-      say("");
-    }
     if (chatgptRepair.needed && chatgptRepair.userMessage) {
       say(chatgptRepair.userMessage);
       if (chatgptRepair.mcpUrl) say(`新的连接地址：${chatgptRepair.mcpUrl}`);
@@ -689,15 +712,13 @@ program
       say("");
     }
     say(
-      allOk && !chatgptRepair.needed && !namedRepair.needed
+      allOk && !chatgptRepair.needed
         ? "Everything looks good."
         : chatgptRepair.needed
           ? "本地已就绪，还需要在 ChatGPT 删除并重新添加该连接。"
-          : namedRepair.needed
-            ? "固定域名还没连上，需要先登录 Cloudflare。"
-            : "仍有问题未解决，可尝试 `c2c restart --tunnel`。"
+          : "仍有问题未解决，可尝试 `c2c restart --tunnel`。"
     );
-    if (!allOk || namedRepair.needed) process.exitCode = 1;
+    if (!allOk) process.exitCode = 1;
   });
 
 // ---------------------------------------------------------------- pair / unpair
@@ -709,7 +730,17 @@ program
   .option("--json", "machine-readable output", false)
   .action(async (opts: { workspace?: string; json: boolean }) => {
     try {
-      const { runtime } = await ensureBridge(resolveWorkspace(opts.workspace));
+      const context = resolveConnection(resolveWorkspace(opts.workspace));
+      const { runtime } = await ensureBridge(context.connection.root);
+      if (context.shared) {
+        const info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+        if (info.tokenCount === 0) {
+          throw new Error("PROJECT_PAIRING_REQUIRED: authorize the main project connection before using its worktrees.");
+        }
+        if (opts.json) say(JSON.stringify({ ok: true, reusedConnection: true, requiresPairing: false, context: context.context }));
+        else check("已复用项目授权，此 worktree 无需单独配对");
+        return;
+      }
       const pairing = await adminFetch<PairingResponse>(runtime, "POST", "/admin/pairing");
       if (opts.json) say(JSON.stringify({ ok: true, pairingCode: pairing.code, expiresAt: pairing.expiresAt }));
       else {
@@ -726,8 +757,9 @@ program
   .description("Revoke ChatGPT's access to this workspace immediately")
   .option("-w, --workspace <path>")
   .action(async (opts: { workspace?: string }) => {
-    const root = resolveWorkspace(opts.workspace);
-    const workspace = new Workspace(root);
+    const context = resolveConnection(resolveWorkspace(opts.workspace));
+    if (context.shared) throw new Error("SHARED_CONNECTION: unpair must explicitly target the main project directory.");
+    const workspace = context.connection;
     const runtime = await findLiveBridge(workspace.id);
     if (runtime) {
       await adminFetch(runtime, "POST", "/admin/revoke-all");
@@ -741,13 +773,32 @@ program
 // ---------------------------------------------------------------- logs / workspace / record
 
 program
+  .command("worktree")
+  .description("Register a task worktree with an existing project connection; no new pairing")
+  .requiredOption("--project-root <path>", "the saved project directory that owns the connection")
+  .option("-w, --workspace <path>", "actual task worktree")
+  .option("--json", "machine-readable output", false)
+  .action((opts: { projectRoot: string; workspace?: string; json: boolean }) => {
+    try {
+      const project = new Workspace(resolveWorkspace(opts.projectRoot));
+      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      bindWorktree(project, workspace);
+      const context = resolveConnection(workspace.root);
+      if (opts.json) say(JSON.stringify({ ok: true, context: context.context }));
+      else check("已登记任务工作区，将复用所属项目的连接");
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
+program
   .command("logs")
   .description("Show recent bridge logs")
   .option("-w, --workspace <path>")
   .option("-n, --lines <n>", "number of lines", "50")
   .option("--verbose", "include debug detail", false)
   .action((opts: { workspace?: string; lines: string; verbose: boolean }) => {
-    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const workspace = resolveConnection(resolveWorkspace(opts.workspace)).connection;
     const candidates = [
       path.join(getStateDir(), "logs", "bridge.log"),
       path.join(getStateDir(), "logs", `bridge-${workspace.id}.out.log`),
@@ -769,9 +820,10 @@ program
   .option("-w, --workspace <path>")
   .option("--json", "machine-readable output", false)
   .action((opts: { workspace?: string; json: boolean }) => {
-    const workspace = new Workspace(resolveWorkspace(opts.workspace));
+    const context = resolveConnection(resolveWorkspace(opts.workspace));
+    const workspace = context.workspace;
     const project = workspace.detectProject();
-    const data = { workspaceId: workspace.id, name: workspace.name, root: workspace.root, ...project };
+    const data = { workspaceId: workspace.id, name: workspace.name, root: workspace.root, ...project, context: context.context };
     if (opts.json) say(JSON.stringify(data));
     else {
       say(`Workspace：${data.name}（${data.workspaceId}）`);
@@ -829,7 +881,7 @@ acceptUnusedWorkspaceOption(
   .action((opts: { force: boolean; json: boolean }) => {
     const file = path.join(getStateDir(), "update-check.json");
     const today = new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD in local tz
-    let last: { date?: string; updateAvailable?: boolean } = {};
+    let last: { date?: string; updateAvailable?: boolean; localCommit?: string } = {};
     try {
       last = JSON.parse(fs.readFileSync(file, "utf8")) as typeof last;
     } catch {
@@ -848,12 +900,17 @@ acceptUnusedWorkspaceOption(
       else say(data.note ?? "已是最新版本。");
     };
 
-    if (!opts.force && last.date === today) {
+    const local = runGit(["rev-parse", "HEAD"]);
+    const changes = runGit(["status", "--porcelain"]);
+    if (changes.ok && changes.stdout) {
+      emit({ checked: false, updateAvailable: false, note: "本地有修改，保留当前安装，不自动覆盖。" });
+      return;
+    }
+    if (!opts.force && last.date === today && last.localCommit === local.stdout) {
       emit({ checked: false, updateAvailable: last.updateAvailable ?? false, note: "今天已检查过更新。" });
       return;
     }
 
-    const local = runGit(["rev-parse", "HEAD"]);
     const remote = runGit(["ls-remote", "origin", "HEAD"]);
     if (!local.ok || !remote.ok || !remote.stdout) {
       // Offline or not a git checkout: skip quietly and retry tomorrow-ish (do not
@@ -862,10 +919,11 @@ acceptUnusedWorkspaceOption(
       return;
     }
     const remoteCommit = remote.stdout.split(/\s/)[0];
-    const updateAvailable = remoteCommit !== local.stdout;
+    const localAhead = remoteCommit !== local.stdout && runGit(["merge-base", "--is-ancestor", remoteCommit, local.stdout]).ok;
+    const updateAvailable = remoteCommit !== local.stdout && !localAhead;
     fs.mkdirSync(getStateDir(), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({ date: today, updateAvailable, remoteCommit }), { mode: 0o600 });
-    emit({ checked: true, updateAvailable, localCommit: local.stdout, remoteCommit });
+    fs.writeFileSync(file, JSON.stringify({ date: today, updateAvailable, localCommit: local.stdout, remoteCommit }), { mode: 0o600 });
+    emit({ checked: true, updateAvailable, localCommit: local.stdout, remoteCommit, ...(localAhead ? { note: "本地包含扩展提交，保留当前安装。" } : {}) });
   });
 
 // ---------------------------------------------------------------- session (ChatGPT conversation / Project memory)
@@ -880,10 +938,10 @@ session
   .option("-w, --workspace <path>")
   .option("--json", "machine-readable output", false)
   .action((opts: { workspace?: string; json: boolean }) => {
-    const workspace = new Workspace(resolveWorkspace(opts.workspace));
-    const saved = readSession(workspace.id);
+    const context = resolveConnection(resolveWorkspace(opts.workspace));
+    const { session: saved, inheritedProject, needsConversationRebind } = taskSession(context);
     const conversation = resolveConversation(saved);
-    if (opts.json) say(JSON.stringify({ ok: true, session: saved, conversation }));
+    if (opts.json) say(JSON.stringify({ ok: true, session: saved, conversation, inheritedProject, needsConversationRebind, context: context.context }));
     else if (!saved) {
       say("尚未记录 ChatGPT 会话。新仓库默认使用 Project 合集。");
     } else {
@@ -939,7 +997,8 @@ session
       nextStep?: string;
       clearCheckpoint: boolean;
     }) => {
-      const workspace = new Workspace(resolveWorkspace(opts.workspace));
+      const context = resolveConnection(resolveWorkspace(opts.workspace));
+      const workspace = context.workspace;
       const modeRaw = opts.mode?.trim().toLowerCase();
       if (modeRaw && modeRaw !== "long-chat" && modeRaw !== "project") {
         throw new Error("mode must be long-chat or project");
@@ -957,7 +1016,7 @@ session
       if (waitingNorm && !WAITING_FOR.includes(waitingNorm as WaitingFor)) {
         throw new Error(`waiting-for must be one of ${WAITING_FOR.join(", ")}`);
       }
-      const saved = mergeSession(readSession(workspace.id), {
+      const saved = mergeSession(taskSession(context).session, {
         url: opts.url,
         title: opts.title,
         taskId: opts.task,
@@ -1128,8 +1187,8 @@ tunnelCmd
   .option("--json", "machine-readable output", false)
   .action((opts: { workspace?: string; zone?: string; json: boolean }) => {
     try {
-      const workspace = new Workspace(resolveWorkspace(opts.workspace));
-      const payload = tunnelChoicePayload(workspace, opts.zone);
+      const context = resolveConnection(resolveWorkspace(opts.workspace));
+      const payload = { ...tunnelChoicePayload(context.connection, opts.zone), context: context.context };
       if (opts.json) {
         say(JSON.stringify(payload));
         return;
@@ -1151,8 +1210,12 @@ tunnelCmd
   .option("--hostname <hostname>", "override the default c2c-<project>.<zone>")
   .option("--json", "machine-readable output", false)
   .action(async (opts: { mode: string; workspace?: string; zone?: string; hostname?: string; json: boolean }) => {
-    const root = resolveWorkspace(opts.workspace);
+    const context = resolveConnection(resolveWorkspace(opts.workspace));
+    const root = context.connection.root;
     try {
+      if (context.shared) {
+        throw new Error("SHARED_CONNECTION: connection settings must explicitly target the main project directory.");
+      }
       const workspace = new Workspace(root);
       const mode = opts.mode.trim().toLowerCase();
       const previous = readTunnelState(workspace.id);

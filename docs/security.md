@@ -2,9 +2,13 @@
 
 ## Trust boundaries
 
-1. **Workspace root** is the smallest authorization boundary. One bridge serves
-   exactly one workspace; every token is bound to `workspace_id`; a token for
-   project A returns 403 on project B's bridge.
+1. **Project connection** retains its original authorization identity. Every
+   token stays bound to `workspace_id`; a token for project A returns 403 on
+   project B's bridge. The local Codex harness can register task worktrees to a
+   project only after verifying that they are actual Git worktrees of the same
+   repository. Remote MCP tools cannot add bindings. A subtree cannot register
+   the rest of its parent repository, and a separately configured linked
+   project is not silently attached to another project's connection.
 2. **Workspace content is untrusted.** README, comments, diffs may contain
    prompt injection. Every MCP tool description carries an explicit warning and
    tools never grant capabilities based on file content.
@@ -22,6 +26,8 @@
 | Code interception | PKCE S256 mandatory (plain rejected); authorization codes are one-time, 5-minute TTL, bound to client + redirect URI |
 | Token theft | Opaque high-entropy tokens; stored only as SHA-256 hashes; access tokens live 1 h; refresh tokens rotate on every use (replay of the old one fails); revocation endpoint + `c2c unpair` |
 | Workspace traversal | `realpath` canonicalization of the deepest existing ancestor; containment check against the canonical root; case-insensitive comparison on macOS/Windows; rejects `..`, absolute escapes, backslash tricks, null bytes |
+| Worktree confusion | Each request includes `worktree_id`, optionally guarded by `expected_branch`. Selection checks the local binding and live Git registry, never changes a global current directory, and returns both selected and connection workspace IDs. Missing, removed, foreign or branch-switched contexts fail closed. |
+| Weakened task ignore rules | Task file/list/search/diff operations enforce both the project's and the worktree's sensitive-file rules; a task's negation cannot re-enable files denied by its project. |
 | Symlink escape | Canonicalization resolves symlinks before the containment check (file and directory symlinks both covered by tests) |
 | Sensitive files | Deny-by-default patterns (.env*, keys, SSH, cloud creds, keychains…) enforced at resolve time — reads, listings, and search all pass through the same gate; `git diff` adds pathspec excludes; `.env.example` allowed |
 | Oversized file / diff DoS | read_file caps lines and bytes per response; git_diff paginates by byte offset with hard caps; search caps matches and file sizes |

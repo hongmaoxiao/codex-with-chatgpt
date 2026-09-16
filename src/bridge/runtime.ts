@@ -52,14 +52,16 @@ export async function probeBridge(
   port: number,
   timeoutMs = 2000
 ): Promise<HealthPayload | null> {
+  return probeBridgeAt(`http://127.0.0.1:${port}`, timeoutMs);
+}
+
+/** Verify the service identity, not merely an HTTP 200 from a proxy/login page. */
+export async function probeBridgeAt(baseUrl: string, timeoutMs = 8000): Promise<HealthPayload | null> {
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const response = await fetch(`http://127.0.0.1:${port}/health`, { signal: controller.signal });
-    clearTimeout(timer);
+    const response = await fetch(`${baseUrl.replace(/\/$/, "")}/health`, { signal: AbortSignal.timeout(timeoutMs) });
     if (!response.ok) return null;
     const body = (await response.json()) as HealthPayload;
-    if (body.service !== SERVICE_NAME) return null;
+    if (body.service !== SERVICE_NAME || body.status !== "ok" || typeof body.workspaceId !== "string") return null;
     return body;
   } catch {
     return null;

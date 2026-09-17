@@ -1,0 +1,18 @@
+{
+  "connections": {
+    "linear_example": {
+      "workspaceName": "your-workspace",
+      "workspaceId": "00000000-0000-0000-0000-000000000001",
+      "userId": "00000000-0000-0000-0000-000000000002",
+      "keychainAccount": "existing-codex-mcp-keychain-account"
+    }
+  },
+  "connectorWorkspaces": [
+    {
+      "connector": "Linear",
+      "workspaceName": "your-default-workspace",
+      "workspaceId": "00000000-0000-0000-0000-000000000003",
+      "userId": "00000000-0000-0000-0000-000000000004"
+    }
+  ]
+}

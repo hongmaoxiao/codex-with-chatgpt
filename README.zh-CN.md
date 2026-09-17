@@ -1,5 +1,11 @@
 # Codex with ChatGPT
 
+本 fork 增加了项目连接复用、独立 worktree 路由、受保护的上游同步与本机升级。
+原项目：[XiaoDuoYa/codex-with-chatgpt](https://github.com/XiaoDuoYa/codex-with-chatgpt)。
+参见 [fork 维护流程](docs/fork-maintenance.md) 和 [Linear 调度助手](automation/linear/README.md)。
+本机更新跟随本 fork 已验证的 main；原作者的更新由独立同步任务整合。
+
+
 [English](README.md) | **简体中文**
 
 > ChatGPT 负责思考，Codex 负责干活。
@@ -27,8 +33,8 @@ Agent（Codex），然后去倒杯咖啡：
 
 1. 环境自检：需要 git 和 Node.js ≥ 20，缺什么就自动安装
   （macOS 用 Homebrew，Windows 用 winget），同时安装 cloudflared。
-2. 下载：把 https://github.com/XiaoDuoYa/codex-with-chatgpt 克隆到
-   ~/codex-with-chatgpt（已存在就 git pull 更新）。
+2. 下载：把 https://github.com/hongmaoxiao/codex-with-chatgpt 克隆到
+   ~/codex-with-chatgpt（已存在则核验远端并按 fork 维护流程更新，保留本地修改）。
 3. 构建：在该目录里执行 corepack pnpm install 和 corepack pnpm build。
 4. 安装 Skill：把仓库里的 skill/SKILL.md 复制到
    ~/.codex/skills/codex-with-chatgpt/SKILL.md，并把文件中

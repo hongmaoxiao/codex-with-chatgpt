@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import path from "node:path";
+import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, isolateStateDir, makeTmpDir } from "./helpers.js";
@@ -26,7 +27,13 @@ describe("machine-wide commands accept leftover -w", () => {
   });
 
   it("update-check --json -w does not fail with unknown option", () => {
-    dirs.push(isolateStateDir());
+    const stateDir = isolateStateDir();
+    dirs.push(stateDir);
+    const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: projectRoot, encoding: "utf8" }).stdout.trim();
+    // This is an argument-parsing check; use a cached result, not live GitHub.
+    fs.writeFileSync(path.join(stateDir, "update-check.json"), JSON.stringify({
+      date: new Date().toLocaleDateString("en-CA"), localCommit: head, updateAvailable: false,
+    }));
     const result = runCli(["update-check", "--json", "-w", "C:/Projects/aquant"], {
       C2C_STATE_DIR: process.env.C2C_STATE_DIR,
     });

@@ -26,7 +26,7 @@ import {
   TUNNEL_CHOICE_PROMPT,
 } from "../tunnel/state.js";
 import { Logger } from "../logger/index.js";
-import { getStateDir } from "../config/paths.js";
+import { getStateDir, writeSecureJson } from "../config/paths.js";
 import { ensureSandboxAllowlist, getCodexConfigPath, isStateDirAllowlisted } from "../config/sandbox-allow.js";
 import { mergeUiPrefs, readUiPrefs, SETUP_MODES, type SetupMode } from "../config/ui-prefs.js";
 import {
@@ -881,7 +881,7 @@ acceptUnusedWorkspaceOption(
   .action((opts: { force: boolean; json: boolean }) => {
     const file = path.join(getStateDir(), "update-check.json");
     const today = new Date().toLocaleDateString("en-CA"); // YYYY-MM-DD in local tz
-    let last: { date?: string; updateAvailable?: boolean; localCommit?: string } = {};
+    let last: { date?: string; updateAvailable?: boolean; localCommit?: string; managedFork?: boolean } = {};
     try {
       last = JSON.parse(fs.readFileSync(file, "utf8")) as typeof last;
     } catch {
@@ -894,6 +894,9 @@ acceptUnusedWorkspaceOption(
       localCommit?: string;
       remoteCommit?: string;
       note?: string;
+      managedFork?: boolean;
+      upstreamUpdateAvailable?: boolean;
+      needsReconciliation?: boolean;
     }): void => {
       if (opts.json) say(JSON.stringify({ ok: true, version: VERSION, ...data }));
       else if (data.updateAvailable) say(`发现新版本（本地 ${data.localCommit?.slice(0, 7)} → 远端 ${data.remoteCommit?.slice(0, 7)}）。`);
@@ -907,7 +910,32 @@ acceptUnusedWorkspaceOption(
       return;
     }
     if (!opts.force && last.date === today && last.localCommit === local.stdout) {
-      emit({ checked: false, updateAvailable: last.updateAvailable ?? false, note: "今天已检查过更新。" });
+      emit({ checked: false, updateAvailable: last.updateAvailable ?? false, managedFork: last.managedFork, note: "今天已检查过更新。" });
+      return;
+    }
+
+    if (fs.existsSync(path.join(repoRoot, "maintenance.json"))) {
+      const python = process.env.C2C_PYTHON ?? (process.platform === "win32" ? "python" : "python3");
+      const result = spawnSync(python, [path.join(repoRoot, "scripts", "maintenance.py"), "check", "--client-only", "--root", repoRoot], {
+        cwd: repoRoot, encoding: "utf8", timeout: 60_000, windowsHide: true,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      });
+      try {
+        const status = JSON.parse(result.stdout ?? "") as {
+          ok: boolean; updateAvailable: boolean; installedCommit: string; forkCommit: string;
+          upstreamUpdateAvailable?: boolean; localAhead: boolean; diverged: boolean; error?: string;
+        };
+        if (result.status !== 0 || !status.ok) throw new Error(status.error ?? "Fork check failed");
+        writeSecureJson(file, { date: today, updateAvailable: status.updateAvailable, localCommit: status.installedCommit, managedFork: true });
+        emit({ checked: true, managedFork: true, updateAvailable: status.updateAvailable,
+          localCommit: status.installedCommit, remoteCommit: status.forkCommit,
+          upstreamUpdateAvailable: status.upstreamUpdateAvailable,
+          needsReconciliation: status.localAhead || status.diverged,
+          note: status.localAhead || status.diverged ? "保留本地扩展，由维护任务整合；不直接覆盖安装。" : undefined });
+      } catch (error) {
+        emit({ checked: false, managedFork: true, updateAvailable: false,
+          note: `Fork 更新检查未完成，保留当前版本：${result.error?.message ?? (error as Error).message}` });
+      }
       return;
     }
 
@@ -921,8 +949,7 @@ acceptUnusedWorkspaceOption(
     const remoteCommit = remote.stdout.split(/\s/)[0];
     const localAhead = remoteCommit !== local.stdout && runGit(["merge-base", "--is-ancestor", remoteCommit, local.stdout]).ok;
     const updateAvailable = remoteCommit !== local.stdout && !localAhead;
-    fs.mkdirSync(getStateDir(), { recursive: true });
-    fs.writeFileSync(file, JSON.stringify({ date: today, updateAvailable, localCommit: local.stdout, remoteCommit }), { mode: 0o600 });
+    writeSecureJson(file, { date: today, updateAvailable, localCommit: local.stdout, remoteCommit });
     emit({ checked: true, updateAvailable, localCommit: local.stdout, remoteCommit, ...(localAhead ? { note: "本地包含扩展提交，保留当前安装。" } : {}) });
   });
 

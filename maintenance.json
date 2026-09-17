@@ -1,0 +1,7 @@
+{
+  "fork": "hongmaoxiao/codex-with-chatgpt",
+  "upstream": "XiaoDuoYa/codex-with-chatgpt",
+  "branch": "main",
+  "customizationAnchor": "cfbb672df685adfafe41c8812b0537005291741e",
+  "requiredChecks": ["verify (ubuntu-latest)", "verify (macos-latest)"]
+}

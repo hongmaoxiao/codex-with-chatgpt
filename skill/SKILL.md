@@ -146,7 +146,7 @@ that close the tab, hide the window, or stall on the settings page.
      the chat already bound in THIS Codex conversation)
    - Saved Project collection: `conversation.projectUrl`
      (`https://chatgpt.com/g/g-p-…/project`)
-   Never click Reconnect / Refresh on an existing connector. The old address is
+   For a reclaimed/dead address, never use Reconnect / Refresh. The old address is
    dead and that page hangs on "This site cannot be reached". When the address
    changed: Delete THIS workspace's `connectorName` only, then create it again
    via the 加插件 URL (same name, new Server URL). Do not put that public
@@ -227,6 +227,13 @@ commands (both are cheap / cached; never mention them unless an update exists):
   Then run the update workflow below, and CONTINUE the original task afterwards.
 
 ## Workflow: update（"更新 Codex with ChatGPT"，or triggered by the daily check）
+
+When the checkout contains `maintenance.json` or update-check reports
+`managedFork: true`, use [Fork maintenance](references/fork-maintenance.md).
+The installed client follows the fork's verified `origin/main`; a separate
+maintenance task integrates the original author's `upstream/main`. Do not merge
+upstream into the running installation during an unrelated coding task.
+The remaining steps below apply only to checkouts without this fork policy.
 
 Inside the checkout directory (see Locations):
 

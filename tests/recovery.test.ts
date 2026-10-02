@@ -62,6 +62,89 @@ describe("shared connection recovery", () => {
     }
   }, 20_000);
 
+  it("observes an unfinished tunnel start without restarting or reclaiming its address", async () => {
+    const stateDir = isolateStateDir(); dirs.push(stateDir);
+    const root = temporary("doctor-pending-project");
+    const workspace = new Workspace(root);
+    const url = await publicRoute(() => ({ service: "c2c-bridge", status: "ok", workspaceId: workspace.id }));
+    let finishStart!: () => void;
+    const ready = new Promise<void>((resolve) => { finishStart = resolve; });
+    let starts = 0;
+    let running = false;
+    const tunnel: TunnelProvider = {
+      name: "cloudflare-quick",
+      async start() { starts++; await ready; running = true; return url; },
+      async stop() { running = false; },
+      async restart(port) { await this.stop(); return this.start(port); },
+      status() { return { running, url: running ? url : null, provider: this.name }; },
+      getPublicUrl() { return running ? url : null; },
+      async doctor() { return { provider: this.name, binaryFound: true, binaryPath: null, running, url, problems: [] }; },
+    };
+    const bridge = await startBridge({ workspaceRoot: root, port: 0, tunnelProvider: tunnel }); bridges.push(bridge);
+    const runtime = (await ensureBridge(root)).runtime;
+    writeLastEndpoint({ workspaceId: workspace.id, connectorName: "Existing", publicUrl: url, mcpUrl: `${url}/mcp`, port: bridge.port });
+    try {
+      await expect(adminFetch(runtime, "POST", "/admin/tunnel/start", 100)).rejects.toMatchObject({ name: "AbortError" });
+      expect(await adminFetch(runtime, "GET", "/admin/info")).toMatchObject({ tunnelOperationPending: true });
+      const result = await execute(process.execPath, ["--import", "tsx", path.join(repoRoot, "src/cli/index.ts"), "doctor", "-w", root, "--json"], {
+        cwd: repoRoot, timeout: 15_000,
+        env: { ...process.env, C2C_STATE_DIR: stateDir, CODEX_HOME: temporary("pending-doctor-codex") },
+      }).then(
+        ({ stdout }) => ({ stdout, code: 0 }),
+        (error) => {
+          if (typeof error.code !== "number" || typeof error.stdout !== "string") throw error;
+          return { stdout: error.stdout as string, code: error.code as number };
+        }
+      );
+      const report = JSON.parse(result.stdout);
+      expect(result.code).toBe(1);
+      expect(report.report.tunnel.detail).toContain("TUNNEL_START_PENDING");
+      expect(report.chatgptRepair.needed).toBe(false);
+      expect(report.namedRepair.needed).toBe(false);
+      expect(starts).toBe(1);
+      expect(readLastEndpoint(workspace.id)?.mcpUrl).toBe(`${url}/mcp`);
+    } finally {
+      finishStart();
+      await expect.poll(async () => (await adminFetch<{ tunnelOperationPending: boolean }>(runtime, "GET", "/admin/info")).tunnelOperationPending).toBe(false);
+    }
+    expect(await adminFetch(runtime, "GET", "/admin/info")).toMatchObject({ publicUrl: url });
+  }, 20_000);
+
+  it("keeps a healthy named connection when daemon credentials are unavailable to doctor", async () => {
+    const stateDir = isolateStateDir(); dirs.push(stateDir);
+    const root = temporary("doctor-healthy-project");
+    const workspace = new Workspace(root);
+    const url = await publicRoute(() => ({ service: "c2c-bridge", status: "ok", workspaceId: workspace.id }));
+    let starts = 0;
+    let running = false;
+    const tunnel: TunnelProvider = {
+      name: "cloudflare-named",
+      async start() { starts++; running = true; return url; },
+      async stop() { running = false; },
+      async restart(port) { await this.stop(); return this.start(port); },
+      status() { return { running, url, provider: this.name }; },
+      getPublicUrl() { return url; },
+      async doctor() { return { provider: this.name, binaryFound: true, binaryPath: null, running, url, problems: [] }; },
+    };
+    writeTunnelState({ workspaceId: workspace.id, preference: "named", tunnelId: "11111111-1111-4111-8111-111111111111", tunnelName: "test", hostname: "project.example.com" });
+    const bridge = await startBridge({ workspaceRoot: root, port: 0, tunnelProvider: tunnel }); bridges.push(bridge);
+    const runtime = (await ensureBridge(root)).runtime;
+    await adminFetch(runtime, "POST", "/admin/tunnel/start");
+    const endpoint = { workspaceId: workspace.id, connectorName: "Existing", publicUrl: url, mcpUrl: `${url}/mcp`, port: bridge.port };
+    writeLastEndpoint(endpoint);
+    const result = await execute(process.execPath, ["--import", "tsx", path.join(repoRoot, "src/cli/index.ts"), "doctor", "-w", root, "--json"], {
+      cwd: repoRoot, timeout: 15_000,
+      env: { ...process.env, C2C_STATE_DIR: stateDir, CODEX_HOME: temporary("healthy-doctor-codex"),
+        TUNNEL_ORIGIN_CERT: path.join(root, "missing-cert.pem"), TUNNEL_CRED_FILE: path.join(root, "missing-credentials.json") },
+    });
+    const report = JSON.parse(result.stdout);
+    expect(report.report.tunnel).toEqual({ ok: true, detail: url });
+    expect(report.namedRepair.needed).toBe(false);
+    expect(report.chatgptRepair.needed).toBe(false);
+    expect(starts).toBe(1);
+    expect(readLastEndpoint(workspace.id)?.mcpUrl).toBe(endpoint.mcpUrl);
+  }, 20_000);
+
   it.each([true, false])("doctor verifies actual public recovery (recovers=%s) without inventing an account login", async (recovers) => {
     const stateDir = isolateStateDir(); dirs.push(stateDir);
     const root = temporary("doctor-project");
@@ -79,7 +162,11 @@ describe("shared connection recovery", () => {
       getPublicUrl() { return url; },
       async doctor() { return { provider: this.name, binaryFound: true, binaryPath: null, running, url, problems: [] }; },
     };
-    writeTunnelState({ workspaceId: workspace.id, preference: "named", askedAt: new Date().toISOString(), tunnelName: "test", hostname: "project.example.com", zone: "example.com" });
+    const tunnelId = "11111111-1111-4111-8111-111111111111";
+    const credentials = temporary("doctor-credentials");
+    const certPath = write(credentials, "cert.pem", "synthetic certificate");
+    const credentialPath = write(credentials, "tunnel.json", JSON.stringify({ TunnelID: tunnelId, TunnelSecret: "synthetic-secret" }));
+    writeTunnelState({ workspaceId: workspace.id, preference: "named", askedAt: new Date().toISOString(), tunnelId, tunnelName: "test", hostname: "project.example.com", zone: "example.com" });
     const bridge = await startBridge({ workspaceRoot: root, port: 0, tunnelProvider: tunnel }); bridges.push(bridge);
     const runtime = (await ensureBridge(root)).runtime;
     await Promise.all([adminFetch(runtime, "POST", "/admin/tunnel/start"), adminFetch(runtime, "POST", "/admin/tunnel/start")]);
@@ -89,9 +176,16 @@ describe("shared connection recovery", () => {
     fs.chmodSync(write(binaries, "cloudflared", "#!/bin/sh\nexit 0\n"), 0o700);
     const result = await execute(process.execPath, ["--import", "tsx", path.join(repoRoot, "src/cli/index.ts"), "doctor", "-w", root, "--json"], {
       cwd: repoRoot, timeout: 15_000,
-      env: { ...process.env, C2C_STATE_DIR: stateDir, CODEX_HOME: temporary("doctor-codex"), PATH: `${binaries}${path.delimiter}${process.env.PATH}` },
-    });
+      env: { ...process.env, C2C_STATE_DIR: stateDir, CODEX_HOME: temporary("doctor-codex"), TUNNEL_ORIGIN_CERT: certPath, TUNNEL_CRED_FILE: credentialPath, PATH: `${binaries}${path.delimiter}${process.env.PATH}` },
+    }).then(
+      ({ stdout }) => ({ stdout, code: 0 }),
+      (error) => {
+        if (typeof error.code !== "number" || typeof error.stdout !== "string") throw error;
+        return { stdout: error.stdout as string, code: error.code as number };
+      }
+    );
     const report = JSON.parse(result.stdout);
+    expect(result.code).toBe(recovers ? 0 : 1);
     expect(report.report.tunnel.ok).toBe(recovers);
     expect(report.namedRepair.needed).toBe(false);
     expect(report.chatgptRepair.needed).toBe(false);

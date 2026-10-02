@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -29,7 +31,7 @@ beforeAll(async () => {
   write(root, "private.txt", "tracked private baseline");
   git(root, "add", "private.txt");
   git(root, "commit", "-m", "tracked private fixture");
-  write(root, ".c2cignore", "private.txt\n");
+  write(root, ".c2cignore", "private.txt\nprivate.png\n");
   bridge = await startBridge({ workspaceRoot: root, port: 0, persistRuntime: false });
   // Authorization exists before either task checkout; no new pairing/token is created per worktree.
   token = bridge.authStore.issueTokens({ clientId: "existing-project-client", scopes: ["workspace.read", "workspace.search", "git.read", "execution.read", "offline_access"] }).accessToken;
@@ -40,11 +42,14 @@ beforeAll(async () => {
     git(root, "worktree", "add", "-b", branch, target);
     write(target, "src/index.ts", `export const marker = "${marker}";\n`);
     write(target, `${marker}-only.txt`, marker);
+    const image = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from(marker)]);
+    fs.writeFileSync(path.join(target, "pixel.png"), image);
+    fs.writeFileSync(path.join(target, "private.png"), image);
     write(target, "private.txt", `private-${marker}`);
     write(target, ".env", `TOKEN=private-${marker}`);
     const workspace = new Workspace(target);
     bindWorktree(bridge.workspace, workspace);
-    appendExecutionRecord(workspace.id, { taskId: marker, iteration: 1, changedFiles: ["src/index.ts"], tests: `${marker} passed`, exitStatus: "ok", timestamp: new Date().toISOString() });
+    appendExecutionRecord(workspace.id, { taskId: marker, executor: `executor-${marker}`, iteration: 1, changedFiles: ["src/index.ts"], tests: `${marker} passed`, exitStatus: "ok", timestamp: new Date().toISOString() });
     saveExecutionOutput(workspace.id, { command: `test-${marker}`, raw: `${marker} test output`, exitCode: 0, taskId: marker, iteration: 1 });
     const client = new Client({ name: `task-${marker}`, version: "1" });
     await client.connect(new StreamableHTTPClientTransport(new URL(`${bridge.localBaseUrl()}/mcp`), { requestInit: { headers: { authorization: `Bearer ${token}` } } }));
@@ -88,7 +93,9 @@ describe("one authenticated connection, parallel task worktrees", () => {
       expect(diff).toContain(`+export const marker = "${marker}"`);
       expect(diff).not.toContain(`private-${marker}`);
       expect(diff).not.toContain("private.txt");
-      expect((await call("test_status")).taskId).toBe(marker);
+      const testStatus = await call("test_status");
+      expect(testStatus.taskId).toBe(marker);
+      expect(testStatus.executor).toBe(`executor-${marker}`);
       expect((await call("execution_summary")).records.map((item: any) => item.taskId)).toEqual([marker]);
       const outputs = await call("execution_output", { action: "list" });
       expect(outputs.items[0].taskId).toBe(marker);
@@ -101,6 +108,38 @@ describe("one authenticated connection, parallel task worktrees", () => {
     const primary = data(await targets[0].client.callTool({ name: "read_file", arguments: { worktree_id: bridge.workspace.id, path: "src/index.ts" } }));
     expect(primary.workspaceId).toBe(bridge.workspace.id);
     expect(primary.content).toContain("answer = 42");
+  });
+
+  it("routes images to each selected worktree with the existing authorization", async () => {
+    await Promise.all(targets.map(async ({ workspace, branch, marker, client }) => {
+      const result = await client.callTool({ name: "read_image", arguments: {
+        worktree_id: workspace.id, expected_branch: branch, path: "pixel.png",
+      } });
+      expect(data(result)).toEqual({
+        workspaceId: workspace.id, connectionWorkspaceId: bridge.workspace.id,
+        path: "pixel.png", sizeBytes: 8 + marker.length, mimeType: "image/png",
+      });
+      expect(result.content).toContainEqual({ type: "image", mimeType: "image/png",
+        data: fs.readFileSync(path.join(workspace.root, "pixel.png")).toString("base64") });
+    }));
+    expect(bridge.authStore.tokenCount()).toBe(2);
+  });
+
+  it("requires a valid worktree selection and applies project file policy to images", async () => {
+    const { client, workspace } = targets[0];
+    for (const [args, code] of [
+      [{ path: "pixel.png" }, "WORKTREE_SELECTION_REQUIRED"],
+      [{ worktree_id: workspace.id, expected_branch: "wrong-branch", path: "pixel.png" }, "WORKTREE_CONTEXT_MISMATCH"],
+      [{ worktree_id: "not-authorized", path: "pixel.png" }, "WORKTREE_NOT_FOUND"],
+      [{ worktree_id: workspace.id, path: ".env" }, "ACCESS_DENIED_SENSITIVE_FILE"],
+      [{ worktree_id: workspace.id, path: "private.png" }, "ACCESS_DENIED_SENSITIVE_FILE"],
+      [{ worktree_id: workspace.id, path: "../pixel.png" }, "PATH_OUTSIDE_WORKSPACE"],
+    ] as const) {
+      const result = await client.callTool({ name: "read_image", arguments: args });
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result)).toContain(code);
+      expect((result.content as Array<{ type: string }>).some((item) => item.type === "image")).toBe(false);
+    }
   });
 
   it("rejects a wrong branch, an unknown worktree and sensitive files over HTTP", async () => {

@@ -11,9 +11,12 @@ import { resolveConnection, taskSession } from "../config/connection.js";
 import { bindWorktree } from "../workspace/worktrees.js";
 import { AuthStore } from "../auth/store.js";
 import { detectTunnelBinaries } from "../tunnel/detect.js";
+import { QUICK_TUNNEL_START_TIMEOUT_MS } from "../tunnel/cloudflared.js";
 import {
   chooseQuickTunnel,
   hasCloudflaredCert,
+  inspectNamedTunnelCredentials,
+  namedTunnelCredentialRepairMessage,
   ProcessCloudflaredAccount,
   provisionNamedTunnel,
 } from "../tunnel/named-provision.js";
@@ -56,8 +59,11 @@ import {
 } from "../session/state.js";
 import { appendExecutionRecord } from "../execution/records.js";
 import { saveExecutionOutput } from "../execution/output.js";
+import { importMediaAsset } from "../media/import.js";
 
 const program = new Command();
+// Allow the provider's full startup budget plus time to return the admin response.
+const TUNNEL_REQUEST_TIMEOUT_MS = Math.max(90_000, QUICK_TUNNEL_START_TIMEOUT_MS) + 5_000;
 
 const say = (msg: string): void => {
   process.stdout.write(msg + "\n");
@@ -183,6 +189,7 @@ interface AdminInfo {
   port: number;
   publicUrl: string | null;
   tunnel: { running: boolean; url: string | null; provider: string };
+  tunnelOperationPending?: boolean;
   tokenCount: number;
   pairingActive: boolean;
   pid: number;
@@ -204,7 +211,8 @@ async function ensureBridgeAndTunnel(
         "NEED_CLOUDFLARED: cloudflared is not installed. Install it first (macOS: brew install cloudflared)."
       );
     }
-    const result = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", 90_000);
+    if (info.tunnelOperationPending) throw new Error("TUNNEL_START_PENDING: wait for the existing tunnel operation, then run doctor.");
+    const result = await adminFetch<TunnelStartResponse>(runtime, "POST", "/admin/tunnel/start", TUNNEL_REQUEST_TIMEOUT_MS);
     if (!result.url) throw new Error(result.message ?? "Tunnel start failed");
     info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
     mcpUrl = `${result.url}/mcp`;
@@ -537,6 +545,9 @@ program
       : "Codex with ChatGPT";
     const tunnelState = workspace ? readTunnelState(workspace.id) : null;
     const namedReady = tunnelState ? isNamedTunnelReady(tunnelState) : false;
+    const namedCredential = namedReady ? inspectNamedTunnelCredentials(tunnelState?.tunnelId) : null;
+    const namedCredentialFailure = Boolean(namedCredential && namedCredential.status !== "ready");
+    let namedRepair: { needed: boolean; userMessage?: string } = { needed: false };
     let chatgptRepair: {
       needed: boolean;
       reason?: string;
@@ -573,7 +584,7 @@ program
           detail: info.capabilities?.worktrees ? "已复用项目连接" : "BRIDGE_UPGRADE_REQUIRED",
         };
       }
-      if (namedReady && opts.fix && info.tunnel.provider !== "cloudflare-named") {
+      if (namedReady && !namedCredentialFailure && opts.fix && info.tunnel.provider !== "cloudflare-named") {
         await stopBridge(root);
         try {
           runtime = (await ensureBridge(root)).runtime;
@@ -587,14 +598,15 @@ program
       let currentUrl = info.publicUrl ?? info.tunnel.url;
       let healthy = currentUrl ? (await probeBridgeAt(currentUrl))?.workspaceId === info.workspaceId : false;
 
-      if ((!currentUrl || !healthy) && opts.fix && (expectedPublic || info.tunnel.running)) {
+      let tunnelUncertain = Boolean(info.tunnelOperationPending);
+      if ((!currentUrl || !healthy) && !tunnelUncertain && !namedCredentialFailure && opts.fix && (expectedPublic || info.tunnel.running)) {
         try {
           const binaries = detectTunnelBinaries();
           if (!binaries.cloudflared) {
             report.tunnel = { ok: false, detail: "NEED_CLOUDFLARED" };
           } else {
             const route = info.tunnel.running ? "/admin/tunnel/restart" : "/admin/tunnel/start";
-            const started = await adminFetch<TunnelStartResponse>(runtime, "POST", route, 55_000);
+            const started = await adminFetch<TunnelStartResponse>(runtime, "POST", route, TUNNEL_REQUEST_TIMEOUT_MS);
             if (started.url) {
               const previousUrl = lastEndpoint?.publicUrl;
               currentUrl = started.url;
@@ -613,10 +625,33 @@ program
           }
         } catch (error) {
           report.tunnel = { ok: false, detail: (error as Error).message };
+          // A request timeout does not cancel the daemon's tunnel operation.
+          tunnelUncertain = error instanceof Error && ["AbortError", "TypeError"].includes(error.name);
+          try {
+            info = await adminFetch<AdminInfo>(runtime, "GET", "/admin/info");
+            currentUrl = info.publicUrl ?? info.tunnel.url;
+            healthy = currentUrl ? (await probeBridgeAt(currentUrl))?.workspaceId === info.workspaceId : false;
+            tunnelUncertain ||= Boolean(info.tunnelOperationPending);
+          } catch {
+            tunnelUncertain = true;
+          }
         }
       }
 
-      if (currentUrl && healthy) {
+      // A healthy named tunnel may use credentials visible only to its daemon.
+      const healthyNamedTunnel = healthy && info.tunnel.provider === "cloudflare-named";
+      if (tunnelUncertain && !healthy) {
+        report.tunnel = { ok: false, detail: "TUNNEL_START_PENDING: 状态尚未确认，保留原连接并稍后运行 doctor" };
+      } else if (namedCredentialFailure && namedCredential && !healthyNamedTunnel) {
+        report.tunnel = {
+          ok: false,
+          detail: `NAMED_TUNNEL_CREDENTIAL_${namedCredential.status.toUpperCase()}`,
+        };
+        namedRepair = {
+          needed: true,
+          userMessage: namedTunnelCredentialRepairMessage(namedCredential.status),
+        };
+      } else if (currentUrl && healthy) {
         report.tunnel = { ok: true, detail: currentUrl };
         const nextMcp = mcpUrlFromPublic(currentUrl);
         const action = connectorAction(lastEndpoint?.mcpUrl, nextMcp);
@@ -665,6 +700,15 @@ program
       }
     } else if (bridgeUnknown) {
       report.tunnel = report.tunnel ?? { ok: false, detail: "Bridge 状态无法确认，未执行连接器修复" };
+    } else if (namedCredentialFailure && namedCredential) {
+      report.tunnel = {
+        ok: false,
+        detail: `NAMED_TUNNEL_CREDENTIAL_${namedCredential.status.toUpperCase()}`,
+      };
+      namedRepair = {
+        needed: true,
+        userMessage: namedTunnelCredentialRepairMessage(namedCredential.status),
+      };
     } else if (namedReady) {
       report.tunnel = { ok: false, detail: "NAMED_TUNNEL_DOWN" };
     } else if (lastEndpoint?.publicUrl) {
@@ -680,7 +724,10 @@ program
     }
 
     if (opts.json) {
-      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair: { needed: false }, context: context.context }));
+      say(JSON.stringify({ report, repairs: results, chatgptRepair, namedRepair, context: context.context }));
+      const hasFailures =
+        Object.values(report).some((value) => !value.ok) || chatgptRepair.needed || namedRepair.needed;
+      if (hasFailures) process.exitCode = 1;
       return;
     }
     say(`${PRODUCT_NAME} Doctor`);
@@ -711,12 +758,18 @@ program
       if (chatgptRepair.pairingCode) say(`配对码：${chatgptRepair.pairingCode}`);
       say("");
     }
+    if (namedRepair.needed && namedRepair.userMessage) {
+      say(namedRepair.userMessage);
+      say("");
+    }
     say(
-      allOk && !chatgptRepair.needed
+      allOk && !chatgptRepair.needed && !namedRepair.needed
         ? "Everything looks good."
         : chatgptRepair.needed
           ? "本地已就绪，还需要在 ChatGPT 删除并重新添加该连接。"
-          : "仍有问题未解决，可尝试 `c2c restart --tunnel`。"
+          : namedRepair.needed
+            ? "固定域名需要先按上面的诊断提示处理。"
+            : "仍有问题未解决，可尝试 `c2c restart --tunnel`。"
     );
     if (!allOk) process.exitCode = 1;
   });
@@ -986,6 +1039,33 @@ session
     }
   });
 
+// ---------------------------------------------------------------- generated media handoff
+
+const assetCmd = program
+  .command("asset")
+  .description("Safely hand downloaded media into the current workspace");
+
+assetCmd
+  .command("import", { isDefault: true })
+  .description("Validate and copy a downloaded image or video into the workspace")
+  .requiredOption("--from <path>", "downloaded source file")
+  .requiredOption("--to <path>", "new workspace-relative destination")
+  .option("-w, --workspace <path>")
+  .option("--json", "machine-readable output", false)
+  .action(async (opts: { from: string; to: string; workspace?: string; json: boolean }) => {
+    try {
+      const result = await importMediaAsset({
+        workspaceRoot: resolveWorkspace(opts.workspace),
+        sourcePath: opts.from,
+        destinationPath: opts.to,
+      });
+      if (opts.json) say(JSON.stringify({ ok: true, ...result }));
+      else check(`媒体已导入：${result.destinationPath}`);
+    } catch (error) {
+      handleCliError(error, opts.json);
+    }
+  });
+
 session
   .command("set")
   .description("Save the ChatGPT Project and/or conversation for this workspace")
@@ -1142,13 +1222,14 @@ acceptUnusedWorkspaceOption(
 
 program
   .command("record", { hidden: true })
-  .description("Record a Codex execution summary (used by the Skill)")
+  .description("Record an execution summary (used by the Skill)")
   .option("-w, --workspace <path>")
   .requiredOption("--task <id>")
   .requiredOption("--iteration <n>", "non-negative execution iteration", parseNonNegativeInteger)
   .option("--changed-files <filesOrCount>", "comma-separated files or a count", "0")
   .option("--tests <summary>", "e.g. '27 passed'")
   .option("--exit-status <status>", "ok | failed | blocked", "ok")
+  .option("--executor <id>", "id of the executor that ran this iteration, e.g. codex")
   .option("--notes <text>")
   .option("--command <text>", "command whose output may be offered to ChatGPT")
   .option("--output <text>", "command output (prefer --output-file for long logs)")
@@ -1162,6 +1243,7 @@ program
       changedFiles: string;
       tests?: string;
       exitStatus: string;
+      executor?: string;
       notes?: string;
       command?: string;
       output?: string;
@@ -1194,6 +1276,7 @@ program
         tests: opts.tests ?? null,
         exitStatus: opts.exitStatus,
         timestamp: new Date().toISOString(),
+        executor: opts.executor?.slice(0, 80),
         notes: opts.notes?.slice(0, 400),
         outputId,
         outputAvailable,

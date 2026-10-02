@@ -196,6 +196,8 @@ that close the tab, hide the window, or stall on the settings page.
 
 - The codex-with-chatgpt checkout lives at: `<ACTUAL_CHECKOUT_PATH>`
   (installer/update MUST replace this line in the installed Skill with the user's actual checkout path.)
+- Codex home: let `<codex-home>` be a non-empty `CODEX_HOME` when set; otherwise
+  use `~/.codex` (`%USERPROFILE%\.codex` on Windows).
 - CLI: let `<checkout>` mean the path on the previous line; run
   `node "<checkout>/bin/c2c.js" <command>` (or `c2c <command>` if globally linked).
   All commands support `--json` for parsing.
@@ -218,7 +220,7 @@ commands (both are cheap / cached; never mention them unless an update exists):
 2. `c2c sandbox-allow --json` (do not pass `-w`) — writes the C2C state directory into Codex's
    sandbox `writable_roots` (macOS: `~/Library/Application Support/codex-with-chatgpt`;
    Windows: `%LOCALAPPDATA%\codex-with-chatgpt`; config file is
-   `~/.codex/config.toml` on both, or `%USERPROFILE%\.codex\config.toml` on Windows).
+   `<codex-home>/config.toml`; see **Locations**).
    If already allowlisted, this is a no-op and does not trigger elevation.
 
 - `{ "updateAvailable": false }` → continue silently. Never mention the check.
@@ -243,7 +245,7 @@ Inside the checkout directory (see Locations):
    verification before it replaces a running bridge.
 2. `corepack pnpm install && corepack pnpm build`.
 3. Re-install `skill/SKILL.md` and its `skill/references/` files under
-   `~/.codex/skills/codex-with-chatgpt/`, then fix the "checkout lives at:"
+   `<codex-home>/skills/codex-with-chatgpt/`, then fix the "checkout lives at:"
    line to the actual checkout path. Preserve machine-specific notes in the
    installed Skill.
 4. `c2c sandbox-allow --json` (so existing installs pick up the sandbox allowlist),
@@ -664,6 +666,26 @@ If status is restricted, ignore it and review from git_diff.
 10. On BLOCKED: read ChatGPT's reason, fix what you can, or surface the single
     decision the user must make.
     `c2c session set -w <ws> --protocol-state BLOCKED --waiting-for USER --known-issues "<short reason>"`
+
+## Workflow: ChatGPT-generated media
+
+The connector remains read-only. It can view supported PNG/JPEG/GIF/WebP
+files with `read_image`, but it cannot write into the repository or retrieve a
+browser download by itself.
+
+When the user asks ChatGPT web to generate an image or video:
+
+1. Generate it in the workspace's saved ChatGPT conversation using the same
+   built-in browser tab and connector rules above.
+2. Activate the finished asset's actual Download control through the visible
+   ChatGPT UI. Browser screenshots are navigation evidence only; never save,
+   crop, rename, or import a screenshot as the requested asset.
+3. Import the original download through the local execution harness:
+   `c2c asset import -w <ws> --from <downloaded-file> --to <new-workspace-relative-path> --json`.
+4. The destination must be new and project-relative. The importer validates
+   PNG/JPEG/GIF/WebP/MP4/MOV/WebM content, rejects SVG and path
+   escapes, and never overwrites an existing file. Include the imported path in
+   EXECUTED/review.
 
 ## Workflow: disconnect（"断开 ChatGPT"）
 
